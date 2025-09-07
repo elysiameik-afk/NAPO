@@ -902,6 +902,181 @@ def compute_policy_loss_vanilla(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def compute_arsic_sequence_weights(
+    log_prob_current: torch.Tensor,
+    log_prob_old: torch.Tensor,
+    response_mask: torch.Tensor,
+    C: float = 0.02,
+    gamma_max: float = 5.0,
+    epsilon: float = 1e-8,
+    degradation_threshold: float = 0.1
+) -> torch.Tensor:
+    """
+    Compute A-RSIC (Adaptive Risk-Sensitive Importance Correction) sequence weights.
+
+    This function implements the core innovation of A-RSIC algorithm, which uses
+    risk-sensitive importance weighting based on Certainty Equivalent from decision theory.
+
+    Args:
+        log_prob_current: Current policy log probabilities, shape (batch_size, seq_len)
+        log_prob_old: Old policy log probabilities, shape (batch_size, seq_len)
+        response_mask: Mask for valid tokens, shape (batch_size, seq_len)
+        C: Global risk sensitivity scaling factor (default: 0.02, reduced for better performance)
+        gamma_max: Maximum risk aversion coefficient for numerical stability (default: 5.0)
+        epsilon: Small value to prevent division by zero (default: 1e-8)
+        degradation_threshold: Threshold below which A-RSIC degrades to arithmetic mean (default: 0.1)
+
+    Returns:
+        torch.Tensor: Log of A-RSIC sequence weights, shape (batch_size,)
+    """
+
+    # Step 1: Compute token-level importance weights w_t = exp(log_prob_current - log_prob_old)
+    log_token_weights = log_prob_current - log_prob_old  # (batch_size, seq_len)
+    token_weights = torch.exp(log_token_weights) * response_mask  # Apply mask to zero out padding
+
+    # Step 2: Compute sequence statistics for adaptive risk assessment
+    seq_lengths = response_mask.sum(dim=-1).clamp(min=1)  # (batch_size,)
+
+    # Compute mean and variance of token weights per sequence
+    masked_weights_sum = (token_weights * response_mask).sum(dim=-1)  # (batch_size,)
+    seq_mean = masked_weights_sum / seq_lengths  # (batch_size,)
+
+    # Compute variance: Var = E[w^2] - (E[w])^2
+    seq_var = (token_weights.pow(2) * response_mask).sum(dim=-1) / seq_lengths - seq_mean.pow(2)
+    seq_var = torch.clamp(seq_var, min=0.0)  # Ensure non-negative variance
+    seq_std = torch.sqrt(seq_var + epsilon)  # Add epsilon for numerical stability
+
+    # Step 3: Compute adaptive risk aversion coefficient γ_i
+    # CV_i = std / mean (Coefficient of Variation)
+    cv = seq_std / (seq_mean + epsilon)  # (batch_size,)
+    gamma = torch.clamp(C * cv, min=0.0, max=gamma_max)  # (batch_size,)
+
+    # Step 4: Compute A-RSIC weights using numerically stable Log-Sum-Exp
+    # Use degradation_threshold to determine when to fall back to arithmetic mean
+    is_low_risk = (gamma < degradation_threshold)
+
+    # Prepare for LSE computation: LSE(x) = max(x) + log(mean(exp(x - max(x))))
+    gamma_w = gamma.unsqueeze(-1) * token_weights  # (batch_size, seq_len)
+
+    # Find max while ignoring padding tokens
+    gamma_w_masked = torch.where(
+        response_mask.bool(),
+        gamma_w,
+        torch.tensor(-torch.inf, device=gamma_w.device, dtype=gamma_w.dtype)
+    )
+    max_gamma_w, _ = torch.max(gamma_w_masked, dim=-1, keepdim=True)  # (batch_size, 1)
+
+    # Compute exp(gamma_w - max_gamma_w) and apply mask
+    exp_term = torch.exp(gamma_w - max_gamma_w) * response_mask  # (batch_size, seq_len)
+    mean_exp_term = exp_term.sum(dim=-1) / seq_lengths  # (batch_size,)
+
+    # Complete LSE computation
+    log_mean_exp_term = torch.log(mean_exp_term + epsilon)
+    lse_result = (max_gamma_w.squeeze(-1) + log_mean_exp_term) / (gamma + epsilon)  # (batch_size,)
+
+    # Step 5: Choose between LSE result and stable mean based on risk level
+
+    # ==================== 版本1：截断几何平均（更稳定） ====================
+    # 去掉最极端的10%值，然后取几何平均
+    # def trimmed_geometric_mean(weights, mask, trim_ratio=0.1):
+    #     # 只对有效token计算
+    #     valid_weights = weights * mask
+    #     batch_size, seq_len = weights.shape
+
+    #     trimmed_results = []
+    #     for i in range(batch_size):
+    #         seq_weights = valid_weights[i][mask[i].bool()]
+    #         if len(seq_weights) <= 2:  # 序列太短，直接几何平均
+    #             log_mean = torch.log(seq_weights + epsilon).mean()
+    #         else:
+    #             # 排序并去掉极值
+    #             sorted_weights, _ = torch.sort(seq_weights)
+    #             trim_count = max(1, int(len(seq_weights) * trim_ratio))
+    #             trimmed_weights = sorted_weights[trim_count:-trim_count] if trim_count < len(seq_weights)//2 else sorted_weights
+    #             log_mean = torch.log(trimmed_weights + epsilon).mean()
+    #         trimmed_results.append(log_mean)
+
+    #     return torch.stack(trimmed_results)
+
+    # trimmed_mean_log = trimmed_geometric_mean(token_weights, response_mask)
+    # arsic_log_weights = torch.where(is_low_risk, trimmed_mean_log, lse_result)
+    # ====================================================================
+
+    # ==================== 版本2：调和平均（最稳定） ====================
+    # # 调和平均：n / Σ(1/w_i)，对异常值最不敏感
+    def harmonic_mean_log(weights, mask):
+        # 计算调和平均的对数
+        valid_weights = weights * mask + (1 - mask) * 1.0  # padding位置设为1避免除零
+        reciprocal_sum = (1.0 / (valid_weights + epsilon) * mask).sum(dim=-1)
+        seq_lengths = mask.sum(dim=-1).clamp(min=1)
+        harmonic_mean = seq_lengths / reciprocal_sum
+        return torch.log(harmonic_mean + epsilon)
+    
+    harmonic_mean_log_result = harmonic_mean_log(token_weights, response_mask)
+    arsic_log_weights = torch.where(is_low_risk, harmonic_mean_log_result, lse_result)
+    # ====================================================================
+
+    return arsic_log_weights
+
+
+@register_policy_loss("arsic")
+def compute_policy_loss_arsic(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[DictConfig | ActorConfig] = None,
+    rollout_log_probs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the clipped policy objective using A-RSIC (Adaptive Risk-Sensitive Importance Correction).
+
+    This is the A-RSIC variant that can be selected via:
+    actor_rollout_ref.actor.policy_loss.loss_mode=arsic
+
+    Args: Same as compute_policy_loss_gspo
+    """
+    # Suppress unused variable warnings
+    _ = loss_agg_mode, rollout_log_probs
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+
+    # A-RSIC sequence-level importance ratio computation
+    negative_approx_kl_seq = compute_arsic_sequence_weights(
+        log_prob_current=log_prob,
+        log_prob_old=old_log_prob,
+        response_mask=response_mask
+    )
+
+    # Combined ratio at token level (following GSPO's approach):
+    # s_i,t(θ) = sg[s_i(θ)] · π_θ(y_i,t|x, y_i,<t) / sg[π_θ(y_i,t|x, y_i,<t)]
+    # In log space: log(s_i,t(θ)) = sg[log(s_i(θ))] + log_prob - sg[log_prob]
+    log_seq_importance_ratio = log_prob - log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
+    log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)  # clamp for numerical stability
+
+    # Finally exp() to remove log
+    seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+
+    pg_losses1 = -advantages * seq_importance_ratio
+    pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    # For A-RSIC, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
+
+    # For compatibility, return metrics in the same format as GSPO
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl_seq.unsqueeze(-1).expand_as(log_prob), response_mask)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
 @register_policy_loss("gspo")
 def compute_policy_loss_gspo(
     old_log_prob: torch.Tensor,
@@ -937,11 +1112,23 @@ def compute_policy_loss_gspo(
 
     negative_approx_kl = log_prob - old_log_prob
 
-    # compute sequence-level importance ratio:
+    # ==================== 原始 GSPO 实现 (可手动切换) ====================
+    # Original GSPO sequence-level importance ratio computation:
     # si(θ) = (π_θ(yi|x)/π_θold(yi|x))^(1/|yi|) =
     # exp [(1/|y_i|) * Σ_t log(π_θ(y_i,t|x,y_i,<t)/π_θold(y_i,t|x,y_i,<t))]
-    seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
-    negative_approx_kl_seq = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths
+    # seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
+    # negative_approx_kl_seq = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths
+    # =====================================================================
+
+    # ==================== A-RSIC 创新实现 (可手动切换) ====================
+    # A-RSIC: Adaptive Risk-Sensitive Importance Correction
+    # Uses Certainty Equivalent from decision theory to handle token weight variance
+    negative_approx_kl_seq = compute_arsic_sequence_weights(
+        log_prob_current=log_prob,
+        log_prob_old=old_log_prob,
+        response_mask=response_mask
+    )
+    # ====================================================================
 
     # Combined ratio at token level:
     # s_i,t(θ) = sg[s_i(θ)] · π_θ(y_i,t|x, y_i,<t) / sg[π_θ(y_i,t|x, y_i,<t)]
