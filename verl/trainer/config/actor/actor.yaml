@@ -62,6 +62,19 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Structure-aware masking for format tokens
+  use_structure_mask: false
+
+  # Boost factor for structure tokens when advantages > 0 (1.0 = no boost)
+  structure_boost_factor: 1.0
+
+  # Structure token definitions
+  structure_tokens:
+    think_start: [151667]
+    think_end: [151668]
+    answer_start: [27, 9217, 29]
+    answer_end: [522, 9217, 29]
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

@@ -22,7 +22,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Dict, List
 
 import numpy as np
 import torch
@@ -42,11 +42,82 @@ PolicyLossFn = Callable[
         str,  # loss_agg_mode
         Optional[DictConfig | AlgoConfig],  # config
         torch.Tensor | None,  # rollout_log_probs
+        torch.Tensor | None,  # responses (for structure masking)
     ],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
+
+
+def detect_structure_tokens(responses: torch.Tensor, structure_tokens: Dict[str, List[int]]) -> torch.Tensor:
+    """
+    Detect structure tokens in response sequences.
+
+    Args:
+        responses: Response token IDs, shape (batch_size, response_length)
+        structure_tokens: Dictionary mapping structure names to token ID lists
+
+    Returns:
+        torch.Tensor: Boolean mask indicating structure token positions, shape (batch_size, response_length)
+    """
+    batch_size, response_length = responses.shape
+    structure_mask = torch.zeros_like(responses, dtype=torch.bool)
+
+    # Flatten all structure token IDs
+    all_structure_token_ids = []
+    for token_list in structure_tokens.values():
+        all_structure_token_ids.extend(token_list)
+
+    if not all_structure_token_ids:
+        return structure_mask
+
+    # Convert to tensor for efficient comparison
+    structure_token_tensor = torch.tensor(all_structure_token_ids, device=responses.device, dtype=responses.dtype)
+
+    # Use torch.isin for efficient detection
+    structure_mask = torch.isin(responses, structure_token_tensor)
+
+    return structure_mask
+
+
+def apply_structure_mask(
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    responses: torch.Tensor,
+    structure_tokens: Dict[str, List[int]],
+    boost_factor: float = 1.0
+) -> torch.Tensor:
+    """
+    Apply structure-aware masking to advantages.
+
+    Args:
+        advantages: Advantage values, shape (batch_size, response_length)
+        response_mask: Valid token mask, shape (batch_size, response_length)
+        responses: Response token IDs, shape (batch_size, response_length)
+        structure_tokens: Dictionary mapping structure names to token ID lists
+        boost_factor: Boost factor for structure tokens when advantages > 0
+
+    Returns:
+        torch.Tensor: Modified advantages with structure masking applied
+    """
+    # Detect structure tokens
+    structure_mask = detect_structure_tokens(responses, structure_tokens)
+
+    # Create modified advantages
+    modified_advantages = advantages.clone()
+
+    # For positive advantages: boost structure tokens
+    positive_adv_mask = (advantages > 0) & response_mask.bool()
+    structure_positive_mask = structure_mask & positive_adv_mask
+    modified_advantages[structure_positive_mask] *= boost_factor
+
+    # For negative advantages: mask out structure tokens (set to 0)
+    negative_adv_mask = (advantages < 0) & response_mask.bool()
+    structure_negative_mask = structure_mask & negative_adv_mask
+    modified_advantages[structure_negative_mask] = 0.0
+
+    return modified_advantages
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
@@ -822,6 +893,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    responses: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -863,6 +935,19 @@ def compute_policy_loss_vanilla(
         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
         + f" but get the value: {clip_ratio_c}."
     )
+
+    # Apply structure masking if enabled
+    if (config.policy_loss.get("use_structure_mask", False) and
+        responses is not None):
+        structure_tokens = config.policy_loss.get("structure_tokens", {})
+        boost_factor = config.policy_loss.get("structure_boost_factor", 1.0)
+        advantages = apply_structure_mask(
+            advantages=advantages,
+            response_mask=response_mask,
+            responses=responses,
+            structure_tokens=structure_tokens,
+            boost_factor=boost_factor
+        )
 
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
@@ -1028,6 +1113,7 @@ def compute_policy_loss_arsic(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    responses: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective using A-RSIC (Adaptive Risk-Sensitive Importance Correction).
@@ -1044,6 +1130,19 @@ def compute_policy_loss_arsic(
     assert isinstance(config, ActorConfig)
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+
+    # Apply structure masking if enabled
+    if (config.policy_loss.get("use_structure_mask", False) and
+        responses is not None):
+        structure_tokens = config.policy_loss.get("structure_tokens", {})
+        boost_factor = config.policy_loss.get("structure_boost_factor", 1.0)
+        advantages = apply_structure_mask(
+            advantages=advantages,
+            response_mask=response_mask,
+            responses=responses,
+            structure_tokens=structure_tokens,
+            boost_factor=boost_factor
+        )
 
     # A-RSIC sequence-level importance ratio computation
     negative_approx_kl_seq = compute_arsic_sequence_weights(
@@ -1086,6 +1185,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    responses: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1109,6 +1209,19 @@ def compute_policy_loss_gspo(
     assert isinstance(config, ActorConfig)
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+
+    # Apply structure masking if enabled
+    if (config.policy_loss.get("use_structure_mask", False) and
+        responses is not None):
+        structure_tokens = config.policy_loss.get("structure_tokens", {})
+        boost_factor = config.policy_loss.get("structure_boost_factor", 1.0)
+        advantages = apply_structure_mask(
+            advantages=advantages,
+            response_mask=response_mask,
+            responses=responses,
+            structure_tokens=structure_tokens,
+            boost_factor=boost_factor
+        )
 
     negative_approx_kl = log_prob - old_log_prob
 

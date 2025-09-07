@@ -445,6 +445,10 @@ class DataParallelPPOActor(BasePPOActor):
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                    # Get responses for structure masking if available
+                    responses = model_inputs.get("responses", None)
+
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -453,6 +457,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_log_probs=rollout_log_probs,
+                        responses=responses,
                     )
 
                     if entropy_coeff != 0:

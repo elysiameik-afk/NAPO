@@ -16,25 +16,29 @@ export HYDRA_FULL_ERROR=1
 MAX_RESPONSE_LENGTH=2048
 
 # ===================================================================
-# 结构化Mask配置说明:
-# use_structure_mask: 是否启用结构化mask (true/false)
-# structure_boost_factor: 正优势时格式token的增强倍数 (1.0=不增强, 2.0=双倍增强)
-#
-# 启用结构化mask可以解决格式奖励和内容奖励混淆的问题:
+# A-RSIC + 结构化Mask配置说明:
+# 
+# A-RSIC算法: 自适应风险敏感重要性校正
+# - 低风险序列: 使用调和平均 (稳定)
+# - 高风险序列: 使用LSE逻辑 (风险敏感)
+# 
+# 结构化Mask功能: 解决格式奖励和内容奖励混淆
 # - 优势>0时: 格式token梯度增强 (鼓励正确格式)
 # - 优势<0时: 格式token被mask掉 (避免惩罚格式)
+# 
+# 两者结合: 既有算法稳定性，又有格式学习的解耦
 # ===================================================================
 
 # FIX: 重新使用反斜杠 `\` 来分割长命令，确保脚本可读性和正确性
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    actor_rollout_ref.actor.policy_loss.loss_mode=gspo \
+    actor_rollout_ref.actor.policy_loss.loss_mode=arsic \
     actor_rollout_ref.actor.clip_ratio_low=0.0003 \
     actor_rollout_ref.actor.clip_ratio_high=0.0004 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
-    actor_rollout_ref.actor.policy_loss.use_structure_mask=false \
-    actor_rollout_ref.actor.policy_loss.structure_boost_factor=1.0 \
+    actor_rollout_ref.actor.policy_loss.use_structure_mask=true \
+    actor_rollout_ref.actor.policy_loss.structure_boost_factor=2.0 \
     data.train_files=/root/autodl-tmp/myverl/data/kk/4ppl_few/train.parquet \
     data.val_files=/root/autodl-tmp/myverl/data/kk/4ppl_few/test.parquet \
     data.train_batch_size=16 \
@@ -77,8 +81,8 @@ python3 -m verl.trainer.main_ppo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
     +reward_model.reward_kwargs.max_resp_len=${MAX_RESPONSE_LENGTH} \
     trainer.project_name=Qwen2.5-0.5-TokenEMA \
-    trainer.experiment_name=GSPO_1 \
-    trainer.default_local_dir=/root/autodl-tmp/verldev/Verl_RL/ckpts/Qwen2.5-0.5/GSPO_1 \
+    trainer.experiment_name=ARSIC_StructureMask \
+    trainer.default_local_dir=/root/autodl-tmp/verldev/Verl_RL/ckpts/Qwen2.5-0.5/ARSIC_StructureMask \
     trainer.critic_warmup=0 \
     trainer.save_freq=4 \
     trainer.test_freq=1 \

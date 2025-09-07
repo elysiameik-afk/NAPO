@@ -316,6 +316,10 @@ class MegatronPPOActor(BasePPOActor):
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
         policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+        # Get responses for structure masking if available
+        responses = data.get("responses", None)
+
         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
@@ -323,6 +327,8 @@ class MegatronPPOActor(BasePPOActor):
             response_mask=response_mask,
             loss_agg_mode=loss_agg_mode,
             config=self.config,
+            rollout_log_probs=None,
+            responses=responses,
         )
 
         metrics.update(

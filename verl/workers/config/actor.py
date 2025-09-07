@@ -41,6 +41,9 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        use_structure_mask (bool): Whether to enable structure-aware masking for format tokens.
+        structure_boost_factor (float): Boost factor for format tokens when advantages > 0.
+        structure_tokens (dict): Dictionary mapping structure token names to token IDs.
     """
 
     loss_mode: str = "vanilla"
@@ -49,6 +52,14 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    use_structure_mask: bool = False
+    structure_boost_factor: float = 1.0
+    structure_tokens: dict = field(default_factory=lambda: {
+        'think_start': [151667],
+        'think_end': [151668],
+        'answer_start': [27, 9217, 29],
+        'answer_end': [522, 9217, 29]
+    })
 
 
 @dataclass
